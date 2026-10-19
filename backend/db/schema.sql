@@ -33,7 +33,7 @@ CREATE TABLE campaigns (
   creator_id          UUID NOT NULL REFERENCES users(id),
   title               TEXT NOT NULL,
   description         TEXT,
-  target_amount       NUMERIC(20, 7) NOT NULL,
+  target_amount       NUMERIC(20, 7) NOT NULL CHECK (target_amount > 0),
   raised_amount       NUMERIC(20, 7) NOT NULL DEFAULT 0,
   asset_type          TEXT NOT NULL CHECK (asset_type IN ('XLM', 'USDC')),
   wallet_public_key   TEXT UNIQUE NOT NULL,
@@ -45,9 +45,9 @@ CREATE TABLE campaigns (
                         'technology', 'community', 'arts', 'education',
                         'environment', 'health', 'business', 'open_source', 'other'
                       )),
-  min_contribution    NUMERIC(20, 7),
-  max_contribution    NUMERIC(20, 7),
-  max_per_user        NUMERIC(20, 7),
+  min_contribution    NUMERIC(20, 7) CHECK (min_contribution > 0),
+  max_contribution    NUMERIC(20, 7) CHECK (max_contribution > 0),
+  max_per_user        NUMERIC(20, 7) CHECK (max_per_user > 0),
   featured            BOOLEAN DEFAULT FALSE,
   featured_at         TIMESTAMPTZ,
   featured_note       TEXT,
@@ -59,6 +59,8 @@ CREATE TABLE campaigns (
   share_count         INTEGER NOT NULL DEFAULT 0,
   velocity_alert_threshold NUMERIC(18, 7) DEFAULT 0,
   country             TEXT,
+  draft_version       INTEGER NOT NULL DEFAULT 1,
+  draft_saved_at      TIMESTAMPTZ,
   created_at          TIMESTAMPTZ DEFAULT NOW()
 );
 CREATE TABLE IF NOT EXISTS campaign_updates (
@@ -73,6 +75,20 @@ CREATE TABLE IF NOT EXISTS campaign_updates (
 
 CREATE INDEX IF NOT EXISTS campaign_updates_campaign_created_idx
   ON campaign_updates (campaign_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS campaign_draft_versions (
+  id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  campaign_id UUID NOT NULL REFERENCES campaigns(id) ON DELETE CASCADE,
+  author_id   UUID REFERENCES users(id) ON DELETE SET NULL,
+  version     INTEGER NOT NULL,
+  reason      TEXT NOT NULL DEFAULT 'autosave'
+                CHECK (reason IN ('autosave', 'manual', 'restore')),
+  snapshot    JSONB NOT NULL,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS campaign_draft_versions_campaign_version_idx
+  ON campaign_draft_versions (campaign_id, version DESC);
 
 CREATE TABLE contributions (
   id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -488,6 +504,25 @@ CREATE TABLE notification_preferences (
   disputes BOOLEAN NOT NULL DEFAULT TRUE,
   milestones BOOLEAN NOT NULL DEFAULT TRUE,
   marketing BOOLEAN NOT NULL DEFAULT FALSE,
+  category_digest BOOLEAN NOT NULL DEFAULT TRUE,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+-- Category follows (#957): users subscribe to campaign categories and receive
+-- matching campaigns inside the weekly digest. Mirrors
+-- db/migrations/20260930_category_follows.sql so both bootstrap paths agree.
+CREATE TABLE IF NOT EXISTS category_follows (
+  user_id     UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  category    TEXT NOT NULL CHECK (category IN (
+                'technology', 'community', 'arts', 'education',
+                'environment', 'health', 'business', 'open_source', 'other'
+              )),
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (user_id, category)
+);
+
+CREATE INDEX IF NOT EXISTS category_follows_category_idx
+  ON category_follows (category);
+CREATE INDEX IF NOT EXISTS category_follows_user_idx
+  ON category_follows (user_id);

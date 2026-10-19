@@ -3,13 +3,50 @@ const logger = require('../config/logger');
 const { sendCampaignUpdatePostedEmail } = require('./emailService');
 const { createNotification } = require('./notifications');
 const { notifyFollowers } = require('./campaignFollowService');
+const { filterEnabledUsers } = require('./communicationPreferenceService');
 
 function frontendBaseUrl() {
   return (process.env.FRONTEND_URL || 'http://localhost:5173').replace(/\/$/, '');
 }
 
+const UPDATE_EXCERPT_MAX_LENGTH = 200;
+
+function buildExcerpt(body) {
+  return body.length > UPDATE_EXCERPT_MAX_LENGTH
+    ? `${body.slice(0, UPDATE_EXCERPT_MAX_LENGTH).trim()}…`
+    : body;
+}
+
+/**
+ * Single representation of a campaign update, used by both the creator-facing
+ * preview routes and the real publish-time notifications/emails below, so the
+ * two can never diverge (#945).
+ */
+function renderUpdate({ campaignId, campaignTitle, update }) {
+  const scheduledFor = update.scheduled_for ? new Date(update.scheduled_for).toISOString() : null;
+  const publishedAt =
+    update.status === 'published' ? update.published_at || update.updated_at || null : null;
+
+  return {
+    campaign_id: campaignId,
+    title: update.title,
+    body: update.body,
+    excerpt: buildExcerpt(update.body),
+    notification_title: `${campaignTitle}: ${update.title}`,
+    link: `${frontendBaseUrl()}/campaigns/${campaignId}`,
+    status: update.status,
+    scheduled_for: scheduledFor,
+    published_at: publishedAt,
+    attachments: update.attachments || [],
+  };
+}
+
 /**
  * Dispatches notifications and emails to campaign followers and contributors.
+ *
+ * Contributors who muted the `updates` channel for this specific campaign
+ * (#961) are filtered out before any notification or email is created, so the
+ * per-campaign preference beats the global category default.
  *
  * @param {Object} params
  * @param {string} params.campaignId
@@ -18,9 +55,9 @@ function frontendBaseUrl() {
  * @param {string} params.authorId
  */
 async function sendCampaignUpdateNotifications({ campaignId, campaignTitle, update, authorId }) {
-  const campaignUrl = `${frontendBaseUrl()}/campaigns/${campaignId}`;
-  const updateExcerpt =
-    update.body.length > 200 ? `${update.body.slice(0, 200).trim()}…` : update.body;
+  const rendered = renderUpdate({ campaignId, campaignTitle, update });
+  const campaignUrl = rendered.link;
+  const updateExcerpt = rendered.excerpt;
 
   try {
     const { rows: contributors } = await db.query(
@@ -32,16 +69,35 @@ async function sendCampaignUpdateNotifications({ campaignId, campaignTitle, upda
       [campaignId]
     );
 
+    // Per-campaign opt-out (#961). A failure here must not silently mute
+    // everyone, so fall back to the full contributor list.
+    let reachable = contributors;
+    try {
+      const enabled = await filterEnabledUsers(
+        campaignId,
+        'updates',
+        contributors.map(contributor => contributor.id)
+      );
+      const enabledSet = new Set(enabled);
+      reachable = contributors.filter(contributor => enabledSet.has(contributor.id));
+    } catch (err) {
+      logger.error('Failed to apply per-campaign update preferences', {
+        campaignId,
+        updateId: update.id,
+        error: err.message,
+      });
+    }
+
     await notifyFollowers(
       campaignId,
       'notify_updates',
       {
         type: 'campaign_update',
-        title: `${campaignTitle}: ${update.title}`,
+        title: rendered.notification_title,
         body: updateExcerpt,
         link: `/campaigns/${campaignId}`,
       },
-      [authorId, ...contributors.map(c => c.id)]
+      [authorId, ...reachable.map(c => c.id)]
     ).catch(err => {
       logger.error('Failed to notify campaign followers of update', {
         campaignId,
@@ -51,10 +107,10 @@ async function sendCampaignUpdateNotifications({ campaignId, campaignTitle, upda
     });
 
     await Promise.allSettled(
-      contributors.map(async contributor => {
+      reachable.map(async contributor => {
         await createNotification(contributor.id, {
           type: 'campaign_update',
-          title: `${campaignTitle}: ${update.title}`,
+          title: rendered.notification_title,
           body: updateExcerpt,
           link: `/campaigns/${campaignId}`,
         }).catch(() => {});
@@ -152,6 +208,7 @@ async function publishDueCampaignUpdates() {
 }
 
 module.exports = {
+  renderUpdate,
   sendCampaignUpdateNotifications,
   publishDueCampaignUpdates,
 };

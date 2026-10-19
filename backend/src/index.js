@@ -54,7 +54,7 @@ app.use(cookieParser());
 app.use(require('./middleware/csrf').csrfProtection);
 
 app.use('/api/v1', require('./routes/v1'));
-// NOTE: adminAuditLogs.js is deprecated — audit logs are served via admin.js -> auditLogs.js.
+// NOTE: adminAuditLogs.js is deprecated â€” audit logs are served via admin.js -> auditLogs.js.
 // Do not mount it here; it would shadow GET /api/admin/audit-logs.
 app.use('/api/admin', require('./routes/admin'));
 app.use('/api/anchor', require('./routes/anchor'));
@@ -65,17 +65,26 @@ app.use('/api/campaigns', require('./routes/bulkCampaigns'));
 app.use('/api/campaigns', require('./routes/payoutSchedules'));
 app.use('/api/campaigns', require('./routes/campaignComments'));
 app.use('/api/campaigns', require('./routes/campaignFollowers'));
+app.use('/api/campaigns', require('./routes/campaignCommunicationPreferences'));
+app.use('/api/campaigns', require('./routes/outcomeSurveys'));
 app.use('/api/campaigns', require('./routes/campaignActivity'));
 app.use('/api/campaigns/:campaignId/contribution/preview', require('./routes/pathPaymentPreview'));
 app.use('/api/campaigns', require('./routes/campaigns'));
 app.use('/api/campaigns', require('./routes/campaignUpdates'));
 app.use('/api/campaigns', require('./routes/translations'));
 app.use('/api/campaigns', require('./routes/campaignRequirements'));
+// Sponsor matching pledges live under the campaign they fund; the user-scoped
+// pledge list is served from /api/user/sponsor-matches.
+app.use('/api/campaigns', require('./routes/sponsorMatching').campaignRouter);
+app.use('/api', require('./routes/sponsorMatching').userRouter);
 app.use('/api/campaign-templates', require('./routes/campaignTemplates'));
 app.use('/api/campaign-pools', require('./routes/contributionPools'));
 app.use('/api/contributions', require('./routes/contributions'));
+app.use('/api/contributions', require('./routes/contributionDedications'));
+app.use('/api/campaigns', require('./routes/contributionDedications'));
 app.use('/api/contributor-identity', require('./routes/contributorIdentity'));
 app.use('/api/creator', require('./routes/creatorAnalytics'));
+app.use('/api/creator', require('./routes/payoutForecast'));
 app.use('/api/disputes', require('./routes/disputes'));
 app.use('/api/emails', require('./routes/emails'));
 app.use('/api/embed', require('./routes/embed'));
@@ -89,13 +98,17 @@ app.use('/api/milestones', require('./routes/milestoneChecklists'));
 app.use('/api/nft-rewards', require('./routes/nftRewards'));
 app.use('/api/notifications', require('./routes/notifications'));
 app.use('/api/ops', require('./routes/ops'));
+app.use('/api/rates', require('./routes/rates'));
 app.use('/api/referrals', require('./routes/referrals'));
 app.use('/api/refunds', require('./routes/creatorRefunds'));
 app.use('/api/refund-requests', require('./routes/refundRequests'));
 app.use('/api/sessions', require('./routes/sessions'));
-app.use('/api/sponsor-matching', require('./routes/sponsorMatching'));
+// Legacy mount kept so existing /api/sponsor-matching/* clients keep working.
+app.use('/api/sponsor-matching', require('./routes/sponsorMatching').campaignRouter);
+app.use('/api/sponsor-matching', require('./routes/sponsorMatching').userRouter);
 app.use('/api/stellar-transactions', require('./routes/stellarTransactions'));
 app.use('/api', require('./routes/subscriptions'));
+app.use('/api', require('./routes/categoryFollows'));
 app.use('/api', require('./routes/thankYou'));
 app.use('/api/translations', require('./routes/translations'));
 app.use('/api/treasury', require('./routes/treasury'));
@@ -104,6 +117,11 @@ app.use('/api/credentials', require('./routes/credentialActivity'));
 app.use('/api/wallets', require('./routes/wallets'));
 app.use('/api/webhooks', require('./routes/webhooks'));
 app.use('/api/withdrawals', require('./routes/withdrawals'));
+
+// Development-only route for email template preview (#1036)
+if (process.env.NODE_ENV === 'development') {
+  app.use('/api/dev', require('./routes/dev'));
+}
 
 app.use(normalizeErrorResponse);
 app.use(errorHandler);

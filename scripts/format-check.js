@@ -41,4 +41,7 @@ if (baseSha) {
 
 const prettier = path.join(process.cwd(), 'node_modules', '.bin', 'prettier');
 const result = spawnSync(prettier, ['--check', ...files], { stdio: 'inherit' });
-process.exit(result.status || 1);
+// Exit with Prettier's status; fall back to 1 only if it never produced a
+// status (e.g. killed by a signal). Using `|| 1` here would turn a successful
+// run (status 0) into a failure, since `0 || 1 === 1`.
+process.exit(result.status ?? 1);

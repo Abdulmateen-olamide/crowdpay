@@ -20,9 +20,15 @@ const {
 } = require('../services/stellarService');
 const { sendAlert } = require('../services/alerting');
 const cache = require('../utils/cache');
+const withTransaction = require('../utils/withTransaction');
 const { resolveCampaignLanguage } = require('../utils/campaignLocale');
 const { Keypair } = require('@stellar/stellar-sdk');
 const { encryptSecret } = require('../services/walletService');
+const {
+  PUBLIC_CAMPAIGN_SELECT,
+  publicCampaignColumnList,
+  stripInternalCampaignFields,
+} = require('../lib/publicCampaignColumns');
 const {
   watchCampaignWallet,
   addSSEClient,
@@ -30,6 +36,7 @@ const {
   cleanupStreamForWallet,
 } = require('../services/ledgerMonitor');
 const { emitWebhookEventForUser, WEBHOOK_EVENTS } = require('../services/webhookDispatcher');
+const draftVersionService = require('../services/campaignDraftVersionService');
 const {
   refreshCampaignStatus,
   refreshActiveCampaignStatuses,
@@ -441,7 +448,7 @@ router.get(
     if (min_progress) {
       params.push(Number(min_progress));
       // Progress is (raised_amount / target_amount) * 100
-      filters.push(`(c.raised_amount / c.target_amount) * 100 >= $${params.length}`);
+      filters.push(`(c.raised_amount / NULLIF(c.target_amount, 0)) * 100 >= $${params.length}`);
     }
     // Funding range facet — filter on amount raised so far.
     if (min_funding !== undefined && min_funding !== '' && Number.isFinite(Number(min_funding))) {
@@ -502,7 +509,7 @@ router.get(
     const orderBy = sortExpressions[effectiveSort] || sortExpressions.newest;
 
     const query = `
-    SELECT c.*,
+    SELECT ${PUBLIC_CAMPAIGN_SELECT},
            u.name AS creator_name,
            u.kyc_status AS creator_kyc_status,
            u.verification_status AS creator_verification_status,
@@ -536,7 +543,14 @@ router.get(
   `;
     const result = await db.query(query, [...params, limit, offset]);
 
-    res.json({ total, limit, offset, campaigns: result.rows });
+    // The listing endpoint is public: strip any internal column a widened query
+    // might have selected (fraud_*, content_fingerprint, wallet_secret_encrypted).
+    res.json({
+      total,
+      limit,
+      offset,
+      campaigns: result.rows.map(stripInternalCampaignFields),
+    });
   })
 );
 
@@ -765,11 +779,9 @@ router.post(
       }
       if (!['active', 'funded', 'in_progress'].includes(campaign.status)) {
         await client.query('ROLLBACK');
-        return res
-          .status(409)
-          .json({
-            error: `Milestones cannot be edited while campaign status is "${campaign.status}".`,
-          });
+        return res.status(409).json({
+          error: `Milestones cannot be edited while campaign status is "${campaign.status}".`,
+        });
       }
 
       const { rows: existingRows } = await client.query(
@@ -838,50 +850,46 @@ router.post(
       return res.status(400).json({ error: 'budgets must be an array' });
     }
 
-    const client = await db.connect();
     try {
-      await client.query('BEGIN');
-      const { rows: campaignRows } = await client.query(
-        `SELECT target_amount FROM campaigns WHERE id = $1 FOR UPDATE`,
-        [req.params.id]
-      );
-      if (!campaignRows.length) throw new Error('Campaign not found');
-
-      const totalBudget = budgets.reduce((sum, b) => sum + Number(b.amount), 0);
-      if (
-        budgets.length > 0 &&
-        Math.abs(totalBudget - Number(campaignRows[0].target_amount)) > 0.0001
-      ) {
-        throw new Error(
-          `Total budget (${totalBudget}) must match campaign target amount (${campaignRows[0].target_amount})`
+      const inserted = await withTransaction(async client => {
+        const { rows: campaignRows } = await client.query(
+          `SELECT target_amount FROM campaigns WHERE id = $1 FOR UPDATE`,
+          [req.params.id]
         );
-      }
+        if (!campaignRows.length) throw new Error('Campaign not found');
 
-      await client.query(`DELETE FROM campaign_budget_categories WHERE campaign_id = $1`, [
-        req.params.id,
-      ]);
-
-      const inserted = [];
-      if (budgets.length > 0) {
-        for (const b of budgets) {
-          if (!b.title || !b.amount || Number(b.amount) <= 0) {
-            throw new Error('Invalid budget item');
-          }
-          const { rows } = await client.query(
-            `INSERT INTO campaign_budget_categories (campaign_id, title, amount, description) VALUES ($1, $2, $3, $4) RETURNING *`,
-            [req.params.id, b.title, Number(b.amount), b.description || null]
+        const totalBudget = budgets.reduce((sum, b) => sum + Number(b.amount), 0);
+        if (
+          budgets.length > 0 &&
+          Math.abs(totalBudget - Number(campaignRows[0].target_amount)) > 0.0001
+        ) {
+          throw new Error(
+            `Total budget (${totalBudget}) must match campaign target amount (${campaignRows[0].target_amount})`
           );
-          inserted.push(rows[0]);
         }
-      }
 
-      await client.query('COMMIT');
+        await client.query(`DELETE FROM campaign_budget_categories WHERE campaign_id = $1`, [
+          req.params.id,
+        ]);
+
+        const inserted = [];
+        if (budgets.length > 0) {
+          for (const b of budgets) {
+            if (!b.title || !b.amount || Number(b.amount) <= 0) {
+              throw new Error('Invalid budget item');
+            }
+            const { rows } = await client.query(
+              `INSERT INTO campaign_budget_categories (campaign_id, title, amount, description) VALUES ($1, $2, $3, $4) RETURNING *`,
+              [req.params.id, b.title, Number(b.amount), b.description || null]
+            );
+            inserted.push(rows[0]);
+          }
+        }
+        return inserted;
+      }, db);
       res.status(201).json(inserted);
     } catch (err) {
-      await client.query('ROLLBACK');
       res.status(400).json({ error: err.message });
-    } finally {
-      client.release();
     }
   })
 );
@@ -978,79 +986,75 @@ router.post(
     ]);
     const creatorEmail = userRows[0]?.email;
 
-    const client = await db.connect();
     let clone;
     try {
-      await client.query('BEGIN');
-
-      const { rows } = await client.query(
-        `INSERT INTO campaigns
-         (title, description, target_amount, asset_type, creator_id, status,
-          category, min_contribution, max_contribution, max_per_user, show_backer_amounts,
-          raised_amount, cloned_from)
-       VALUES ($1, $2, $3, $4, $5, 'draft', $6, $7, $8, $9, $10, 0, $11)
-       RETURNING *`,
-        [
-          `${source.title} (Copy)`,
-          source.description,
-          source.target_amount,
-          source.asset_type,
-          req.user.userId,
-          source.category,
-          source.min_contribution,
-          source.max_contribution,
-          source.max_per_user,
-          source.show_backer_amounts,
-          sourceId,
-        ]
-      );
-      clone = rows[0];
-
-      await client.query(
-        `INSERT INTO campaign_members (campaign_id, user_id, email, role, accepted_at)
-       VALUES ($1, $2, $3, 'owner', NOW())`,
-        [clone.id, req.user.userId, creatorEmail]
-      );
-
-      for (const milestone of milestoneRows) {
-        await client.query(
-          `INSERT INTO milestones (campaign_id, title, description, release_percentage, sort_order)
-         VALUES ($1, $2, $3, $4, $5)`,
+      clone = await withTransaction(async client => {
+        const { rows } = await client.query(
+          `INSERT INTO campaigns
+           (title, description, target_amount, asset_type, creator_id, status,
+            category, min_contribution, max_contribution, max_per_user, show_backer_amounts,
+            raised_amount, cloned_from)
+         VALUES ($1, $2, $3, $4, $5, 'draft', $6, $7, $8, $9, $10, 0, $11)
+         RETURNING *`,
           [
-            clone.id,
-            milestone.title,
-            milestone.description,
-            milestone.release_percentage,
-            milestone.sort_order,
+            `${source.title} (Copy)`,
+            source.description,
+            source.target_amount,
+            source.asset_type,
+            req.user.userId,
+            source.category,
+            source.min_contribution,
+            source.max_contribution,
+            source.max_per_user,
+            source.show_backer_amounts,
+            sourceId,
           ]
         );
-      }
+        const createdClone = rows[0];
 
-      if (tierRows.length) {
-        await insertTiers(
-          client,
-          clone.id,
-          tierRows.map(t => ({
-            title: t.title,
-            description: t.description,
-            min_amount: t.min_amount,
-            asset_type: t.asset_type,
-            tier_limit: t.tier_limit,
-            estimated_delivery: t.estimated_delivery,
-          }))
+        await client.query(
+          `INSERT INTO campaign_members (campaign_id, user_id, email, role, accepted_at)
+           VALUES ($1, $2, $3, 'owner', NOW())`,
+          [createdClone.id, req.user.userId, creatorEmail]
         );
-      }
 
-      await client.query('COMMIT');
+        for (const milestone of milestoneRows) {
+          await client.query(
+            `INSERT INTO milestones (campaign_id, title, description, release_percentage, sort_order)
+             VALUES ($1, $2, $3, $4, $5)`,
+            [
+              createdClone.id,
+              milestone.title,
+              milestone.description,
+              milestone.release_percentage,
+              milestone.sort_order,
+            ]
+          );
+        }
+
+        if (tierRows.length) {
+          await insertTiers(
+            client,
+            createdClone.id,
+            tierRows.map(t => ({
+              title: t.title,
+              description: t.description,
+              min_amount: t.min_amount,
+              asset_type: t.asset_type,
+              tier_limit: t.tier_limit,
+              estimated_delivery: t.estimated_delivery,
+            }))
+          );
+        }
+
+        return createdClone;
+      }, db);
     } catch (err) {
-      await client.query('ROLLBACK');
       logger.error('[campaigns] clone failed', {
         source_campaign_id: sourceId,
         error: err.message,
       });
       return res.status(500).json({ error: 'Could not clone campaign' });
-    } finally {
-      client.release();
     }
 
     res.status(201).json(clone);
@@ -1443,7 +1447,7 @@ router.get(
     }
 
     const query = `
-    SELECT c.*,
+    SELECT ${PUBLIC_CAMPAIGN_SELECT},
            (SELECT COUNT(DISTINCT sender_public_key)::int FROM contributions WHERE campaign_id = $1) AS contributor_count,
            u.kyc_status AS creator_kyc_status,
            u.verification_status AS creator_verification_status,
@@ -1500,10 +1504,10 @@ router.get(
     const token =
       req.cookies?.cp_token ||
       (header && header.startsWith('Bearer ') ? header.slice(7).trim() : null);
-    if (token && !token.startsWith('cp_live_') && !token.startsWith('cpk_')) {
+    if (token && !token.startsWith('cpk_')) {
       try {
         const jwt = require('jsonwebtoken');
-        const payload = jwt.verify(token, process.env.JWT_SECRET);
+        const payload = jwt.verify(token, process.env.JWT_SECRET, { algorithms: ['HS256'] });
         if (payload && payload.userId) {
           const { rows: userRows } = await db.query('SELECT is_admin FROM users WHERE id = $1', [
             payload.userId,
@@ -1528,8 +1532,10 @@ router.get(
       return res.status(404).json({ error: 'Campaign not found' });
     }
 
-    // Add notice if campaign is suspended
-    const response = { ...campaign, user_role: userRole };
+    // Add notice if campaign is suspended. `stripInternalCampaignFields` keeps
+    // the public detail payload free of fraud/duplicate internals and the
+    // encrypted wallet key even though the row is fetched with a wide allowlist.
+    const response = { ...stripInternalCampaignFields(campaign), user_role: userRole };
     if (campaign.status === 'suspended') {
       response.suspended_notice =
         'This campaign has been suspended and cannot receive new contributions';
@@ -1629,6 +1635,56 @@ function summariseMilestones(milestones) {
   };
 }
 
+const WIDGET_DESCRIPTION_LENGTH = 200;
+const WIDGET_RECENT_BACKER_LIMIT = 3;
+
+function truncateWidgetDescription(description) {
+  if (!description) return '';
+  return description.length > WIDGET_DESCRIPTION_LENGTH
+    ? `${description.slice(0, WIDGET_DESCRIPTION_LENGTH).trim()}...`
+    : description;
+}
+
+/**
+ * Public "recent backers" strip for the embeddable campaign progress widget.
+ *
+ * The widget is rendered on third-party sites, so this applies the same two
+ * privacy gates as the authenticated backers list (#897): the campaign-level
+ * `show_backer_amounts` flag and each contributor's `contributor_privacy`
+ * preference. Anonymous contributors are never named, and `amount_only`
+ * contributors never leak a display name.
+ */
+async function loadWidgetRecentBackers(campaignId, { limit = WIDGET_RECENT_BACKER_LIMIT } = {}) {
+  const { rows: campaignRows } = await db.query(
+    'SELECT show_backer_amounts FROM campaigns WHERE id = $1',
+    [campaignId]
+  );
+  const showAmounts = campaignRows[0]?.show_backer_amounts !== false;
+
+  const { rows } = await db.query(
+    `SELECT ctr.display_name,
+            ctr.amount,
+            COALESCE(u.contributor_privacy, 'full') AS contributor_privacy
+       FROM contributions ctr
+       LEFT JOIN users u ON u.wallet_public_key = ctr.sender_public_key
+      WHERE ctr.campaign_id = $1 AND ctr.status = 'completed'
+      ORDER BY ctr.created_at DESC
+      LIMIT $2`,
+    [campaignId, limit]
+  );
+
+  return rows
+    .map(row => {
+      const privacy = row.contributor_privacy || 'full';
+      const name = privacy === 'full' ? row.display_name || null : null;
+      const amountVisible = showAmounts && privacy !== 'anonymous';
+      const amount = amountVisible ? Number(row.amount) : null;
+      if (!name && amount === null) return null;
+      return { name: name || 'Anonymous', amount };
+    })
+    .filter(Boolean);
+}
+
 function escapeXml(value) {
   return String(value)
     .replace(/&/g, '&amp;')
@@ -1683,7 +1739,11 @@ router.get(
   })
 );
 
-// Compact widget payload for lightweight iframe embeds
+// Compact widget payload for lightweight iframe embeds.
+//
+// This is the single contract the embeddable campaign progress widget renders
+// (#954). It deliberately exposes only public summary fields — no creator or
+// contributor identifiers, no wallet addresses, no emails.
 router.get(
   '/:id/widget',
   asyncHandler(async (req, res) => {
@@ -1697,10 +1757,16 @@ router.get(
 
     const milestones = await loadPublicCampaignMilestones(campaignId);
     const impact = await computeCampaignImpact(campaignId);
+    const recentBackers = await loadWidgetRecentBackers(campaignId);
+
+    // Widgets poll every 30s; a matching browser/CDN cache keeps embeds from
+    // turning into a request storm on popular campaign pages.
+    res.header('Cache-Control', 'public, max-age=30');
 
     res.json({
       id: summary.id,
       title: summary.title,
+      description: truncateWidgetDescription(summary.description),
       raised_amount: summary.raised_amount,
       target_amount: summary.target_amount,
       asset_type: summary.asset_type,
@@ -1711,6 +1777,7 @@ router.get(
       contribution_url: summary.contribution_url,
       milestones,
       milestone_summary: summariseMilestones(milestones),
+      recent_backers: recentBackers,
       impact,
     });
   })
@@ -2229,7 +2296,7 @@ router.post(
           contract_deployment_status, contract_deployment_error, last_deployment_attempt_at, template_id, category, country,
           status)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23)
-       RETURNING *`,
+       RETURNING ${publicCampaignColumnList('')}`,
         [
           title,
           description,
@@ -2330,7 +2397,9 @@ router.post(
 
     watchCampaignWallet(campaign.id, walletPublicKey);
 
-    res.status(201).json(campaign);
+    // The creation response is the campaign row the creator just wrote: never
+    // echo internal columns (content_fingerprint, fraud_*, wallet key) back.
+    res.status(201).json(stripInternalCampaignFields(campaign));
   })
 );
 
@@ -2414,17 +2483,11 @@ router.post(
       });
     }
 
-    const client = await db.connect();
     try {
-      await client.query('BEGIN');
-      await insertTiers(client, campaignId, normalizedTiers);
-      await client.query('COMMIT');
+      await withTransaction(client => insertTiers(client, campaignId, normalizedTiers), db);
     } catch (err) {
-      await client.query('ROLLBACK');
       logger.error('[campaigns] add reward tiers failed', { error: err.message });
       return res.status(500).json({ error: 'Could not add reward tiers' });
-    } finally {
-      client.release();
     }
 
     const tiers = await listTiersWithAvailability(campaignId);
@@ -2521,11 +2584,9 @@ router.patch(
         const totalBudget = Number(budgetRows[0].total_budget || 0);
 
         if (totalBudget > 0 && Math.abs(totalBudget - newTarget) > 0.0001) {
-          return res
-            .status(422)
-            .json({
-              error: `Cannot update target amount to ${newTarget}: existing budget breakdown total is ${totalBudget}. Clear the budget breakdown first.`,
-            });
+          return res.status(422).json({
+            error: `Cannot update target amount to ${newTarget}: existing budget breakdown total is ${totalBudget}. Clear the budget breakdown first.`,
+          });
         }
 
         updates.target_amount = newTarget;
@@ -2571,14 +2632,10 @@ router.patch(
     UPDATE campaigns
     SET ${setClause}
     WHERE id = $${paramIndex} AND status = $${statusParamIndex}
-    RETURNING *
+    RETURNING ${publicCampaignColumnList('')}
   `;
 
-    let updatedRows = [];
-    const client = await db.connect();
-    try {
-      await client.query('BEGIN');
-
+    const updatedRows = await withTransaction(async client => {
       // Save previous state to revisions
       await client.query(
         `INSERT INTO campaign_revisions (campaign_id, title, description, target_amount)
@@ -2587,15 +2644,8 @@ router.patch(
       );
 
       const result = await client.query(query, values);
-      updatedRows = result.rows;
-
-      await client.query('COMMIT');
-    } catch (err) {
-      await client.query('ROLLBACK');
-      throw err;
-    } finally {
-      client.release();
-    }
+      return result.rows;
+    }, db);
 
     if (!updatedRows.length) {
       const { rows: checkRows } = await db.query('SELECT status FROM campaigns WHERE id = $1', [
@@ -2615,7 +2665,9 @@ router.patch(
     cache.invalidate(`campaigns:id:${campaignId}`);
     cache.invalidatePrefix('campaigns:list:');
 
-    res.json(updatedRows[0]);
+    // Enumerate the public columns instead of returning the raw row so editing
+    // a campaign can never hand the creator the fraud/duplicate internals.
+    res.json(stripInternalCampaignFields(updatedRows[0]));
   })
 );
 
@@ -3518,4 +3570,168 @@ router.post(
   })
 );
 
+// ---------------------------------------------------------------------------
+// Campaign draft autosave + recoverable version history (#942)
+// ---------------------------------------------------------------------------
+
+function mapDraftError(err, res) {
+  if (err.code === 'DRAFT_VERSION_CONFLICT') {
+    return res.status(409).json({ error: err.message, code: err.code, current_version: err.currentVersion });
+  }
+  if (err.statusCode === 404) {
+    return res.status(404).json({ error: err.message });
+  }
+  throw err;
+}
+
+// Autosave editable draft fields with optimistic concurrency. `base_version`
+// (or a `draft_version` body field) is the version the editor started from; a
+// mismatch returns 409 and both versions stay recoverable.
+router.put(
+  '/:id/draft',
+  requireAuth,
+  requireCampaignMember('owner', 'manager', 'editor'),
+  asyncHandler(async (req, res) => {
+    try {
+      const result = await draftVersionService.saveDraft({
+        campaignId: req.params.id,
+        actorId: req.user.userId,
+        fields: req.body || {},
+        expectedVersion: req.body?.base_version ?? req.body?.draft_version,
+      });
+      return res.status(200).json({
+        draft_version: result.draftVersion,
+        draft_saved_at: result.draftSavedAt,
+        material_change: result.materialChange,
+      });
+    } catch (err) {
+      return mapDraftError(err, res);
+    }
+  })
+);
+
+// List retained versions (metadata only) for the editor's history panel.
+router.get(
+  '/:id/draft/versions',
+  requireAuth,
+  requireCampaignMember('owner', 'manager', 'editor', 'viewer'),
+  asyncHandler(async (req, res) => {
+    const versions = await draftVersionService.listVersions({ campaignId: req.params.id });
+    return res.json({ versions });
+  })
+);
+
+// Preview a retained version using the stored snapshot.
+router.get(
+  '/:id/draft/versions/:versionId',
+  requireAuth,
+  requireCampaignMember('owner', 'manager', 'editor', 'viewer'),
+  asyncHandler(async (req, res) => {
+    const version = await draftVersionService.getVersion({
+      campaignId: req.params.id,
+      versionId: req.params.versionId,
+    });
+    if (!version) return res.status(404).json({ error: 'Draft version not found' });
+    return res.json(version);
+  })
+);
+
+// Restore a retained version. Creates a new current version; history is kept.
+router.post(
+  '/:id/draft/versions/:versionId/restore',
+  requireAuth,
+  requireCampaignMember('owner', 'manager', 'editor'),
+  asyncHandler(async (req, res) => {
+    try {
+      const result = await draftVersionService.restoreVersion({
+        campaignId: req.params.id,
+        versionId: req.params.versionId,
+        actorId: req.user.userId,
+        expectedVersion: req.body?.base_version ?? req.body?.draft_version,
+      });
+      return res.json({
+        draft_version: result.draftVersion,
+        restored_from: result.restoredFrom,
+        material_change: result.materialChange,
+      });
+    } catch (err) {
+      return mapDraftError(err, res);
+    }
+  })
+);
+
 module.exports = router;
+
+// ─── Reward-tier inventory + fulfillment (issue #958) ───────────────────────
+const {
+  getFulfillmentsByCampaign,
+  getFulfillmentsByUser,
+  updateFulfillmentStatus,
+  getCampaignFulfillmentSummary,
+} = require('../services/rewardTierService');
+
+router.get(
+  '/:id/fulfillments',
+  requireAuth,
+  requireCampaignMember('owner', 'manager'),
+  asyncHandler(async (req, res) => {
+    const items = await getFulfillmentsByCampaign(req.params.id, { status: req.query.status });
+    const summary = await getCampaignFulfillmentSummary(req.params.id);
+    res.json({ data: items, summary });
+  })
+);
+
+router.patch(
+  '/:id/fulfillments/:fulfillmentId',
+  requireAuth,
+  requireCampaignMember('owner', 'manager'),
+  asyncHandler(async (req, res) => {
+    const { status, tracking_number, carrier, notes } = req.body || {};
+    if (!status) return res.status(422).json({ error: 'status is required' });
+    try {
+      const updated = await updateFulfillmentStatus(req.params.fulfillmentId, status, {
+        trackingNumber: tracking_number,
+        carrier,
+        notes,
+      });
+      res.json(updated);
+    } catch (err) {
+      res.status(err.statusCode || 400).json({ error: err.message });
+    }
+  })
+);
+
+router.get(
+  '/:id/fulfillments/export.csv',
+  requireAuth,
+  requireCampaignMember('owner', 'manager'),
+  asyncHandler(async (req, res) => {
+    const items = await getFulfillmentsByCampaign(req.params.id, { status: req.query.status });
+    const headers = [
+      'id',
+      'tier_title',
+      'status',
+      'shipping_name',
+      'shipping_address_line1',
+      'shipping_address_line2',
+      'shipping_city',
+      'shipping_region',
+      'shipping_postal_code',
+      'shipping_country',
+      'tracking_number',
+      'carrier',
+      'created_at',
+    ];
+    const escape = v => (v === null || v === undefined ? '' : `"${String(v).replace(/"/g, '""')}"`);
+    const csv = [
+      headers.join(','),
+      ...items.map(r => headers.map(h => escape(r[h])).join(',')),
+    ].join('\n');
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader(
+      'Content-Disposition',
+      `attachment; filename="fulfillments-${req.params.id}.csv"`
+    );
+    res.send(csv);
+  })
+);

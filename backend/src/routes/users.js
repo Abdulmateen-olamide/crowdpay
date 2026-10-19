@@ -6,11 +6,16 @@ const { isKycRequiredForCampaigns } = require('../services/kycProvider');
 const { startKycForUser } = require('../services/kycService');
 const { listCreatorCampaigns, listUserContributions } = require('../services/userDashboardService');
 const { listFollowedCampaigns } = require('../services/campaignFollowService');
+const {
+  listForUser: listCommunicationPreferences,
+  resetAllForUser: resetAllCommunicationPreferences,
+} = require('../services/communicationPreferenceService');
 const { evaluateBadges, getLeaderboard } = require('../services/badgeService');
 const { ensureCustodialAccountFundedAndTrusted } = require('../services/stellarService');
 const { withDecryptedWalletSecret } = require('../services/walletSecrets');
 const { sendWalletFundingFailedEmail } = require('../services/emailService');
 const asyncHandler = require('../utils/asyncHandler');
+const { normalizeAmount } = require('../utils/stroops');
 
 router.get(
   '/me',
@@ -242,12 +247,25 @@ router.get(
   '/me/notification-preferences',
   requireAuth,
   asyncHandler(async (req, res) => {
-    const { rows } = await db.query(
-      'SELECT campaign_updates, refunds, disputes, milestones, marketing FROM notification_preferences WHERE user_id = $1',
-      [req.user.userId]
-    );
+    let rows;
+    try {
+      const result = await db.query(
+        'SELECT campaign_updates, refunds, disputes, milestones, marketing, category_digest FROM notification_preferences WHERE user_id = $1',
+        [req.user.userId]
+      );
+      rows = result.rows;
+    } catch (err) {
+      // Backward compatibility: column appears via 20260930 migration; if a
+      // deployment serves traffic mid-rollout, fall back to the legacy shape.
+      if (err?.code !== '42703') throw err;
+      const result = await db.query(
+        'SELECT campaign_updates, refunds, disputes, milestones, marketing FROM notification_preferences WHERE user_id = $1',
+        [req.user.userId]
+      );
+      rows = result.rows;
+    }
     if (rows.length > 0) {
-      res.json(rows[0]);
+      res.json({ category_digest: true, ...rows[0] });
     } else {
       res.json({
         campaign_updates: true,
@@ -255,6 +273,7 @@ router.get(
         disputes: true,
         milestones: true,
         marketing: false,
+        category_digest: true,
       });
     }
   })
@@ -264,10 +283,38 @@ router.patch(
   '/me/notification-preferences',
   requireAuth,
   asyncHandler(async (req, res) => {
-    const { campaign_updates, refunds, disputes, milestones, marketing } = req.body;
+    const { campaign_updates, refunds, disputes, milestones, marketing, category_digest } =
+      req.body;
     const toNull = v => (v === undefined ? null : v);
-    const { rows } = await db.query(
-      `INSERT INTO notification_preferences (user_id, campaign_updates, refunds, disputes, milestones, marketing)
+    const params = [
+      req.user.userId,
+      toNull(campaign_updates),
+      toNull(refunds),
+      toNull(disputes),
+      toNull(milestones),
+      toNull(marketing),
+      toNull(category_digest),
+    ];
+    try {
+      const { rows } = await db.query(
+        `INSERT INTO notification_preferences (user_id, campaign_updates, refunds, disputes, milestones, marketing, category_digest)
+     VALUES ($1, COALESCE($2, TRUE), COALESCE($3, TRUE), COALESCE($4, TRUE), COALESCE($5, TRUE), COALESCE($6, FALSE), COALESCE($7, TRUE))
+     ON CONFLICT (user_id) DO UPDATE SET
+       campaign_updates = COALESCE($2, notification_preferences.campaign_updates),
+       refunds = COALESCE($3, notification_preferences.refunds),
+       disputes = COALESCE($4, notification_preferences.disputes),
+       milestones = COALESCE($5, notification_preferences.milestones),
+       marketing = COALESCE($6, notification_preferences.marketing),
+       category_digest = COALESCE($7, notification_preferences.category_digest),
+       updated_at = NOW()
+     RETURNING campaign_updates, refunds, disputes, milestones, marketing, category_digest`,
+        params
+      );
+      res.json(rows[0]);
+    } catch (err) {
+      if (err?.code !== '42703') throw err;
+      const { rows } = await db.query(
+        `INSERT INTO notification_preferences (user_id, campaign_updates, refunds, disputes, milestones, marketing)
      VALUES ($1, COALESCE($2, TRUE), COALESCE($3, TRUE), COALESCE($4, TRUE), COALESCE($5, TRUE), COALESCE($6, FALSE))
      ON CONFLICT (user_id) DO UPDATE SET
        campaign_updates = COALESCE($2, notification_preferences.campaign_updates),
@@ -277,16 +324,35 @@ router.patch(
        marketing = COALESCE($6, notification_preferences.marketing),
        updated_at = NOW()
      RETURNING campaign_updates, refunds, disputes, milestones, marketing`,
-      [
-        req.user.userId,
-        toNull(campaign_updates),
-        toNull(refunds),
-        toNull(disputes),
-        toNull(milestones),
-        toNull(marketing),
-      ]
-    );
-    res.json(rows[0]);
+        params.slice(0, 6)
+      );
+      res.json({ category_digest: true, ...rows[0] });
+    }
+  })
+);
+
+/**
+ * Per-campaign communication overrides (#961). The account-level
+ * `notification_preferences` above is global; these rows are the "just this
+ * one campaign" layer, keyed by (campaign_id, user_id).
+ *
+ * GET    /api/users/me/communication-preferences  — every campaign the caller muted
+ * DELETE /api/users/me/communication-preferences  — reset them all at once
+ */
+router.get(
+  '/me/communication-preferences',
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    res.json({ campaigns: await listCommunicationPreferences(req.user.userId) });
+  })
+);
+
+router.delete(
+  '/me/communication-preferences',
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const removed = await resetAllCommunicationPreferences(req.user.userId);
+    res.json({ removed });
   })
 );
 
@@ -335,14 +401,18 @@ router.get(
 );
 
 // GET /api/users/me — already proposed in issue #163, implement together
-router.get('/me', requireAuth, async (req, res) => {
-  const { rows } = await db.query(
-    `SELECT id, email, name, wallet_public_key, created_at FROM users WHERE id = $1`,
-    [req.user.userId]
-  );
-  if (!rows.length) return res.status(404).json({ error: 'User not found' });
-  res.json(rows[0]);
-});
+router.get(
+  '/me',
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const { rows } = await db.query(
+      `SELECT id, email, name, wallet_public_key, created_at FROM users WHERE id = $1`,
+      [req.user.userId]
+    );
+    if (!rows.length) return res.status(404).json({ error: 'User not found' });
+    res.json(rows[0]);
+  })
+);
 
 const { getCredentialActivity } = require('../services/auditService');
 
@@ -395,18 +465,22 @@ router.get(
 );
 
 // PATCH /api/users/me — update display name only
-router.patch('/me', requireAuth, async (req, res) => {
-  const { name } = req.body;
-  if (!name || !name.trim()) {
-    return res.status(400).json({ error: 'name is required' });
-  }
-  const { rows } = await db.query(
-    `UPDATE users SET name = $1 WHERE id = $2
+router.patch(
+  '/me',
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const { name } = req.body;
+    if (!name || !name.trim()) {
+      return res.status(400).json({ error: 'name is required' });
+    }
+    const { rows } = await db.query(
+      `UPDATE users SET name = $1 WHERE id = $2
      RETURNING id, email, name, wallet_public_key, created_at`,
-    [name.trim(), req.user.userId]
-  );
-  res.json(rows[0]);
-});
+      [name.trim(), req.user.userId]
+    );
+    res.json(rows[0]);
+  })
+);
 
 const { generateUserExport, getExportDownloadUrl } = require('../services/exportService');
 
@@ -551,8 +625,13 @@ router.post(
   asyncHandler(async (req, res) => {
     const { campaign_id, amount, interval } = req.body;
     if (!campaign_id) return res.status(400).json({ error: 'campaign_id is required' });
-    if (!amount || isNaN(Number(amount)) || Number(amount) <= 0) {
-      return res.status(400).json({ error: 'amount must be a positive number' });
+    let normalizedAmount;
+    try {
+      normalizedAmount = normalizeAmount(amount);
+    } catch {
+      return res.status(400).json({
+        error: 'amount must be positive, fit a Stellar amount, and have at most 7 decimal places',
+      });
     }
     if (!['weekly', 'monthly'].includes(interval)) {
       return res.status(400).json({ error: 'interval must be weekly or monthly' });
@@ -572,7 +651,7 @@ router.post(
       `INSERT INTO recurring_contributions (user_id, campaign_id, amount, interval, next_run_at)
      VALUES ($1, $2, $3, $4, $5)
      RETURNING id, campaign_id, amount, interval, active, next_run_at, run_count`,
-      [req.user.userId, campaign_id, Number(amount), interval, nextRunAt]
+      [req.user.userId, campaign_id, normalizedAmount, interval, nextRunAt]
     );
     res.status(201).json(rows[0]);
   })
@@ -592,10 +671,16 @@ router.patch(
       values.push(!!active);
     }
     if (amount !== undefined) {
-      if (isNaN(Number(amount)) || Number(amount) <= 0)
-        return res.status(400).json({ error: 'amount must be positive' });
+      let normalizedAmount;
+      try {
+        normalizedAmount = normalizeAmount(amount);
+      } catch {
+        return res.status(400).json({
+          error: 'amount must be positive, fit a Stellar amount, and have at most 7 decimal places',
+        });
+      }
       updates.push(`amount = $${idx++}`);
-      values.push(Number(amount));
+      values.push(normalizedAmount);
     }
     if (!updates.length) return res.status(400).json({ error: 'Nothing to update' });
     updates.push(`updated_at = NOW()`);

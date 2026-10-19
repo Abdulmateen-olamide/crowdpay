@@ -50,11 +50,24 @@ apiClient.interceptors.request.use((config) => {
 const MAX_RETRY_QUEUE_SIZE = 100;
 const retryQueue = new Map();
 
+// A parked GET is only settled by retryQueuedRequests(), which NetworkStatusContext
+// calls on the browser's offline -> online transition. Queueing a request that failed
+// while the browser was online would hang the caller, so those reject instead.
+function isBrowserOffline() {
+  return typeof navigator !== 'undefined' && navigator.onLine === false;
+}
+
 apiClient.interceptors.response.use(
   (response) => response,
   (error) => {
     const config = error.config;
-    if (!error.response && config && config.method === 'get' && !config._retried) {
+    if (
+      !error.response &&
+      config &&
+      config.method === 'get' &&
+      !config._retried &&
+      isBrowserOffline()
+    ) {
       config._retried = true;
       const key = JSON.stringify([config.baseURL, config.url, config.params]);
       return new Promise((resolve, reject) => {
@@ -153,6 +166,23 @@ export const api = {
     const res = await apiClient.post(`/campaigns/${campaignId}/requirements`, data);
     return res.data;
   },
+  // --- Sponsor matching pledges (#948) ---
+  async getCampaignMatchingProgress(campaignId) {
+    const res = await apiClient.get(`/campaigns/${campaignId}/matches`);
+    return res.data;
+  },
+  async createSponsorMatchingPledge(campaignId, data) {
+    const res = await apiClient.post(`/campaigns/${campaignId}/matches`, data);
+    return res.data;
+  },
+  async completeSponsorMatchingPledge(campaignId, matchId) {
+    const res = await apiClient.patch(`/campaigns/${campaignId}/matches/${matchId}/complete`);
+    return res.data;
+  },
+  async getMySponsorMatches() {
+    const res = await apiClient.get('/user/sponsor-matches');
+    return res.data;
+  },
   async approveMilestone(id) {
     const res = await apiClient.post(`/milestones/${id}/approve`);
     return res.data;
@@ -171,6 +201,10 @@ export const api = {
   },
   async getPlatformConfig() {
     const res = await apiClient.get('/governance/fee');
+    return res.data;
+  },
+  async getExchangeRates(target = 'NGN') {
+    const res = await apiClient.get('/rates', { params: { target } });
     return res.data;
   },
   async getFeaturedCampaigns() {
@@ -619,4 +653,56 @@ export const api = {
 
   processRefund: (campaignId, payload) =>
     apiClient.post(`/campaigns/${campaignId}/refunds`, payload).then((r) => r.data),
+
+  // --- Per-campaign contributor communication preferences (#961) ---
+  // Effective preferences; the API resolves to the defaults when the
+  // contributor has never overridden anything for this campaign, so callers
+  // never have to handle a missing record.
+  getCampaignCommunicationPreferences: (campaignId) =>
+    apiClient.get(`/campaigns/${campaignId}/communication-preferences`).then((r) => r.data),
+
+  // Partial patch: only the channels present in `patch` are written.
+  setCampaignCommunicationPreferences: (campaignId, patch) =>
+    apiClient.put(`/campaigns/${campaignId}/communication-preferences`, patch).then((r) => r.data),
+
+  resetCampaignCommunicationPreferences: (campaignId) =>
+    apiClient.delete(`/campaigns/${campaignId}/communication-preferences`).then((r) => r.data),
+
+  getCommunicationPreferenceChannels: () =>
+    apiClient.get('/campaigns/communication-preferences/channels').then((r) => r.data),
+
+  getMyCommunicationPreferences: () =>
+    apiClient.get('/users/me/communication-preferences').then((r) => r.data),
+
+  resetMyCommunicationPreferences: () =>
+    apiClient.delete('/users/me/communication-preferences').then((r) => r.data),
+
+  // --- Beneficiary outcome surveys (#960) ---
+  // Public read. Returns `{ survey, response_count, my_response }`; `survey` is
+  // null (not an error) when the campaign has no survey yet.
+  getOutcomeSurvey: (campaignId) =>
+    apiClient.get(`/campaigns/${campaignId}/outcome-survey`).then((r) => r.data),
+
+  createOutcomeSurvey: (campaignId, payload) =>
+    apiClient.post(`/campaigns/${campaignId}/outcome-survey`, payload).then((r) => r.data),
+
+  updateOutcomeSurvey: (campaignId, payload) =>
+    apiClient.put(`/campaigns/${campaignId}/outcome-survey`, payload).then((r) => r.data),
+
+  openOutcomeSurvey: (campaignId, payload = {}) =>
+    apiClient.post(`/campaigns/${campaignId}/outcome-survey/open`, payload).then((r) => r.data),
+
+  closeOutcomeSurvey: (campaignId) =>
+    apiClient.post(`/campaigns/${campaignId}/outcome-survey/close`).then((r) => r.data),
+
+  submitOutcomeSurveyResponse: (campaignId, answers) =>
+    apiClient
+      .post(`/campaigns/${campaignId}/outcome-survey/respond`, { answers })
+      .then((r) => r.data),
+
+  getOutcomeSurveyResults: (campaignId) =>
+    apiClient.get(`/campaigns/${campaignId}/outcome-survey/results`).then((r) => r.data),
+
+  getOutcomeSurveyEvents: (campaignId) =>
+    apiClient.get(`/campaigns/${campaignId}/outcome-survey/events`).then((r) => r.data),
 };

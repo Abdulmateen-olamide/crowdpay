@@ -24,12 +24,12 @@ describe('ThankYouModal', () => {
 
     render(<ThankYouModal campaignId="camp-1" onClose={mockOnClose} onSent={mockOnSent} />);
 
-    expect(screen.getByText('thankYou.bulkTitle')).toBeDefined();
+    expect(screen.getByText('Thank all contributors')).toBeDefined();
 
     const textarea = screen.getByRole('textbox');
     fireEvent.change(textarea, { target: { value: 'Thank you all!' } });
 
-    const submitButton = screen.getByRole('button', { name: /thankYou/i });
+    const submitButton = screen.getByRole('button', { name: /^Send$/ });
     fireEvent.click(submitButton);
 
     await waitFor(() => {
@@ -53,12 +53,12 @@ describe('ThankYouModal', () => {
       />
     );
 
-    expect(screen.getByText('thankYou.individualTitle')).toBeDefined();
+    expect(screen.getByText('Thank a contributor')).toBeDefined();
 
     const textarea = screen.getByRole('textbox');
     fireEvent.change(textarea, { target: { value: 'Thanks Alice!' } });
 
-    const submitButton = screen.getByRole('button', { name: /thankYou/i });
+    const submitButton = screen.getByRole('button', { name: /^Send$/ });
     fireEvent.click(submitButton);
 
     await waitFor(() => {
@@ -76,7 +76,7 @@ describe('ThankYouModal', () => {
     const textarea = screen.getByRole('textbox');
     fireEvent.change(textarea, { target: { value: 'Thank you!' } });
 
-    const submitButton = screen.getByRole('button', { name: /thankYou/i });
+    const submitButton = screen.getByRole('button', { name: /^Send$/ });
     fireEvent.click(submitButton);
 
     await waitFor(() => {
